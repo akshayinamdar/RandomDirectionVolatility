@@ -11,8 +11,10 @@
 input group "=== General Settings ==="
 input double RiskPercent = 1.0;              // Risk per trade (% of account)
 input int MaxPositions = 2;                  // Maximum open positions
-input string TradingStartTime = "03:00";     // Trading start time
-input string TradingEndTime = "21:00";       // Trading end time
+input int TradingStartHour = 3;              // Trading session start hour (0-23)
+input int TradingStartMinute = 0;            // Trading session start minute (0-59)
+input int TradingEndHour = 21;               // Trading session end hour (0-23)
+input int TradingEndMinute = 0;              // Trading session end minute (0-59)
 
 input group "=== Price Action Settings ==="
 input int ChannelPeriod = 10;                // Period for price channel calculation
@@ -103,6 +105,8 @@ void CheckForTradingOpportunity()
 //+------------------------------------------------------------------+
 //| Check if current time is within trading hours                   |
 //+------------------------------------------------------------------+
+//| Check if current time is within trading hours                   |
+//+------------------------------------------------------------------+
 bool IsWithinTradingHours()
 {
     MqlDateTime timeStruct;
@@ -112,21 +116,18 @@ bool IsWithinTradingHours()
     int currentMinute = timeStruct.min;
     int currentTimeMinutes = currentHour * 60 + currentMinute;
     
-    // Parse start time
-    string startParts[];
-    StringSplit(TradingStartTime, ':', startParts);
-    int startHour = (int)StringToInteger(startParts[0]);
-    int startMinute = (int)StringToInteger(startParts[1]);
-    int startTimeMinutes = startHour * 60 + startMinute;
+    // Calculate session times in minutes
+    int startTimeMinutes = TradingStartHour * 60 + TradingStartMinute;
+    int endTimeMinutes = TradingEndHour * 60 + TradingEndMinute;
     
-    // Parse end time
-    string endParts[];
-    StringSplit(TradingEndTime, ':', endParts);
-    int endHour = (int)StringToInteger(endParts[0]);
-    int endMinute = (int)StringToInteger(endParts[1]);
-    int endTimeMinutes = endHour * 60 + endMinute;
-    
-    return (currentTimeMinutes >= startTimeMinutes && currentTimeMinutes <= endTimeMinutes);
+    // Handle cases where trading session spans midnight
+    if(startTimeMinutes <= endTimeMinutes) {
+        // Normal case (e.g., 3:00-21:00)
+        return (currentTimeMinutes >= startTimeMinutes && currentTimeMinutes <= endTimeMinutes);
+    } else {
+        // Overnight case (e.g., 22:00-3:00)
+        return (currentTimeMinutes >= startTimeMinutes || currentTimeMinutes <= endTimeMinutes);
+    }
 }
 
 //+------------------------------------------------------------------+
