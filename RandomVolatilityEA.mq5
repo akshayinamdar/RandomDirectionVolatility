@@ -21,6 +21,7 @@ input int ChannelPeriod = 10;                // Period for price channel calcula
 input int ChannelMAPeriod = 20;              // Moving average period for channel width
 input double ChannelThreshold = 0.7;         // Channel contraction threshold multiplier
 input double MinChannelWidth = 5.0;          // Minimum channel width filter (points)
+input double MeanReversionBias = 20.0;       // Mean reversion bias strength (0-50%)
 
 input group "=== Risk Management ==="
 input double SLMultiplier = 1.5;             // Channel width multiplier for stop loss
@@ -221,10 +222,20 @@ bool IsChannelContracted()
 //+------------------------------------------------------------------+
 void ExecuteRandomTrade()
 {
-    // Generate random direction (0 = BUY, 1 = SELL)
-    // Add extra randomization by using tick count and memory usage
+    // Calculate price position within channel for mean reversion bias
+    double channelPosition = CalculatePriceInChannelPosition();
+      // Apply mean reversion bias: favor opposite direction when price is at extremes
+    // When channelPosition is negative (bottom of channel), favor BUY
+    // When channelPosition is positive (top of channel), favor SELL
+    int biasPercentage = 50 - (int)(channelPosition * MeanReversionBias); // Use configurable bias strength
+    
+    // Generate random number with bias
     int extraRandom = (int)GetTickCount() + (int)MQL5InfoInteger(MQL5_MEMORY_USED);
-    int direction = (MathRand() + extraRandom) % 2;
+    int randomValue = (MathRand() + extraRandom) % 100;
+    int direction = (randomValue < biasPercentage) ? 0 : 1; // 0=BUY, 1=SELL
+      Print("Channel position: ", DoubleToString(channelPosition, 3), 
+          " Bias percentage for BUY: ", biasPercentage, "% (Bias strength: ", MeanReversionBias, "%) Random value: ", randomValue,
+          " Direction: ", (direction == 0 ? "BUY" : "SELL"));
     
     // Get current channel width for stop loss calculation
     double currentChannelWidth = GetCurrentChannelWidth();
@@ -376,6 +387,50 @@ double CalculateLotSize(double stopLossSize)
     Print("Calculated lot size: ", lotSize, " Risk amount: ", riskAmount, " Stop loss size: ", stopLossSize);
     
     return lotSize;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate price position within the channel                      |
+//+------------------------------------------------------------------+
+double CalculatePriceInChannelPosition()
+{
+    // Use GetCurrentChannelWidth for consistent channel calculation
+    double channelWidth = GetCurrentChannelWidth();
+    if(channelWidth <= 0)
+    {
+        Print("Error getting channel width for price position calculation");
+        return 0; // Return middle of channel on error
+    }
+    
+    double highBuffer[], lowBuffer[];
+    ArraySetAsSeries(highBuffer, true);
+    ArraySetAsSeries(lowBuffer, true);
+    
+    // Get high and low data for channel period
+    if(CopyHigh(_Symbol, PERIOD_M1, 0, ChannelPeriod, highBuffer) < 0 ||
+       CopyLow(_Symbol, PERIOD_M1, 0, ChannelPeriod, lowBuffer) < 0)
+    {
+        Print("Error copying price data for price position calculation");
+        return 0; // Return middle of channel on error
+    }
+    
+    // Find highest high and lowest low
+    double highestHigh = highBuffer[ArrayMaximum(highBuffer, 0, ChannelPeriod)];
+    double lowestLow = lowBuffer[ArrayMinimum(lowBuffer, 0, ChannelPeriod)];
+    
+    // Get current price (use close price)
+    double currentPrice = iClose(_Symbol, PERIOD_M1, 0);
+    
+    // Calculate position within channel (0 to 1)
+    double relativePosition = (currentPrice - lowestLow) / channelWidth;
+    
+    // Convert to -1 to 1 range (bottom to top)
+    double normalizedPosition = (relativePosition * 2) - 1;
+    
+    Print("Price position in channel: ", DoubleToString(normalizedPosition, 3), 
+          " (", DoubleToString(relativePosition * 100, 1), "% from bottom)");
+    
+    return normalizedPosition;
 }
 
 //+------------------------------------------------------------------+
