@@ -14,16 +14,23 @@ input int MaxPositions = 2;                  // Maximum open positions
 input string TradingStartTime = "03:00";     // Trading start time
 input string TradingEndTime = "21:00";       // Trading end time
 
-input group "=== Volatility Settings ==="
-input int ATRPeriod = 14;                    // ATR period
-input int ATRMAperiod = 20;                  // Moving average period for ATR
-input double VolatilityThreshold = 0.8;      // Volatility threshold multiplier
+input group "=== Price Action Settings ==="
+input int ChannelPeriod = 10;                // Period for price channel calculation
+input int ChannelMAPeriod = 20;              // Moving average period for channel width
+input double ChannelThreshold = 0.7;         // Channel contraction threshold multiplier
+input double MinChannelWidth = 5.0;          // Minimum channel width filter (points)
 
 input group "=== Risk Management ==="
-input double SLMultiplier = 1.5;             // ATR multiplier for stop loss
+input double SLMultiplier = 1.5;             // Channel width multiplier for stop loss
+
+input group "=== Take Profit Settings ==="
+input double TPPoints_EURUSD = 8.0;          // Take profit for EURUSD (points)
+input double TPPoints_GBPUSD = 8.0;          // Take profit for GBPUSD (points)
+input double TPPoints_USDJPY = 8.0;          // Take profit for USDJPY (points)
+input double TPPoints_BTCUSD = 80.0;         // Take profit for BTCUSD (points)
+input double TPPoints_Default = 8.0;         // Default take profit (points)
 
 //--- Global variables
-int atrHandle;
 datetime lastTradeTime = 0;
 int magicNumber = 123456;
 
@@ -32,18 +39,11 @@ int magicNumber = 123456;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    // Initialize ATR indicator
-    atrHandle = iATR(_Symbol, PERIOD_M1, ATRPeriod);
-    if(atrHandle == INVALID_HANDLE)
-    {
-        Print("Error creating ATR indicator");
-        return(INIT_FAILED);
-    }
-      // Seed random number generator using a combination of time and memory address
+    // Seed random number generator using a combination of time and memory address
     // This ensures different seeds even during backtesting
     MathSrand((int)TimeLocal() + (int)TimeCurrent() + (int)GetTickCount() + (int)MQL5InfoInteger(MQL5_MEMORY_USED));
     
-    Print("RandomVolatilityEA initialized successfully");
+    Print("RandomVolatilityEA (Price Channel Version) initialized successfully");
     return(INIT_SUCCEEDED);
 }
 
@@ -52,9 +52,6 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    if(atrHandle != INVALID_HANDLE)
-        IndicatorRelease(atrHandle);
-    
     Print("RandomVolatilityEA deinitialized");
 }
 
@@ -91,9 +88,8 @@ void CheckForTradingOpportunity()
     // Check maximum positions
     if(CountOpenPositions() >= MaxPositions)
         return;
-    
-    // Check volatility condition
-    if(!IsLowVolatility())
+      // Check price channel contraction condition
+    if(!IsChannelContracted())
         return;
     
     // Prevent multiple trades within same minute
@@ -157,62 +153,90 @@ int CountOpenPositions()
 }
 
 //+------------------------------------------------------------------+
-//| Check for low volatility condition                              |
+//| Check for channel contraction condition                         |
 //+------------------------------------------------------------------+
-bool IsLowVolatility()
+bool IsChannelContracted()
 {
-    double atrBuffer[];
-    ArraySetAsSeries(atrBuffer, true);
-    
-    // Get ATR values
-    if(CopyBuffer(atrHandle, 0, 0, ATRMAperiod + 1, atrBuffer) < 0)
+    // Get current channel width using existing function
+    double currentChannelWidth = GetCurrentChannelWidth();
+    if(currentChannelWidth <= 0)
     {
-        Print("Error copying ATR buffer");
+        Print("Error getting current channel width");
         return false;
     }
     
-    double currentATR = atrBuffer[0];
-    double avgATR = 0;
-    
-    // Calculate average ATR over specified period
-    for(int i = 1; i <= ATRMAperiod; i++)
+    if(currentChannelWidth < MinChannelWidth * _Point)
     {
-        avgATR += atrBuffer[i];
+        Print("Market too quiet. Channel width: ", currentChannelWidth, 
+            " Minimum required: ", MinChannelWidth * _Point);
+        return false;
     }
-    avgATR /= ATRMAperiod;
+
+    double highBuffer[], lowBuffer[];
+    ArraySetAsSeries(highBuffer, true);
+    ArraySetAsSeries(lowBuffer, true);
     
-    // Check if current ATR is below threshold
-    bool lowVol = (currentATR < avgATR * VolatilityThreshold);
-    
-    if(lowVol)
+    // Get high and low data for historical average calculation
+    if(CopyHigh(_Symbol, PERIOD_M1, 0, ChannelMAPeriod + ChannelPeriod, highBuffer) < 0 ||
+       CopyLow(_Symbol, PERIOD_M1, 0, ChannelMAPeriod + ChannelPeriod, lowBuffer) < 0)
     {
-        Print("Low volatility detected. Current ATR: ", DoubleToString(currentATR, 5), 
-              " Average ATR: ", DoubleToString(avgATR, 5));
+        Print("Error copying price data");
+        return false;
     }
     
-    return lowVol;
+    // Calculate average channel width over longer period
+    double avgChannelWidth = 0;
+    int count = 0;
+    
+    for(int i = ChannelPeriod; i < ChannelMAPeriod + ChannelPeriod; i += ChannelPeriod)
+    {
+        double periodHigh = highBuffer[ArrayMaximum(highBuffer, i, ChannelPeriod)];
+        double periodLow = lowBuffer[ArrayMinimum(lowBuffer, i, ChannelPeriod)];
+        double periodChannelWidth = periodHigh - periodLow;
+        
+        avgChannelWidth += periodChannelWidth;
+        count++;
+    }
+    
+    if(count > 0)
+        avgChannelWidth /= count;
+    else
+        return false;
+    
+    // Check if current channel width is below threshold
+    bool contracted = (currentChannelWidth < avgChannelWidth * ChannelThreshold);
+    
+    if(contracted)
+    {
+        Print("Channel contraction detected. Current width: ", DoubleToString(currentChannelWidth, 5), 
+              " Average width: ", DoubleToString(avgChannelWidth, 5));
+    }
+    
+    return contracted;
 }
 
 //+------------------------------------------------------------------+
 //| Execute random trade                                             |
 //+------------------------------------------------------------------+
 void ExecuteRandomTrade()
-{    // Generate random direction (0 = BUY, 1 = SELL)
+{
+    // Generate random direction (0 = BUY, 1 = SELL)
     // Add extra randomization by using tick count and memory usage
     int extraRandom = (int)GetTickCount() + (int)MQL5InfoInteger(MQL5_MEMORY_USED);
     int direction = (MathRand() + extraRandom) % 2;
     
-    // Get current ATR for stop loss calculation
-    double atrBuffer[];
-    ArraySetAsSeries(atrBuffer, true);
-    
-    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) < 0)
+    // Get current channel width for stop loss calculation
+    double currentChannelWidth = GetCurrentChannelWidth();
+    if(currentChannelWidth <= 0)
     {
-        Print("Error getting ATR for trade execution");
+        Print("Error getting channel width for trade execution");
         return;
     }
-      double currentATR = atrBuffer[0];
-    double stopLossSize = currentATR * SLMultiplier;
+    
+    double stopLossSize = currentChannelWidth * SLMultiplier;
+    
+    // Get symbol-specific take profit
+    double takeProfit = GetSymbolTakeProfit();
     
     // Calculate position size
     double lotSize = CalculateLotSize(stopLossSize);
@@ -234,23 +258,24 @@ void ExecuteRandomTrade()
     request.volume = lotSize;
     request.magic = magicNumber;
     request.deviation = 3;
-      if(direction == 0) // BUY
+    
+    if(direction == 0) // BUY
     {
         request.type = ORDER_TYPE_BUY;
         request.price = ask;
         request.sl = bid - stopLossSize;
-        request.tp = 0; // No take profit
+        request.tp = bid + takeProfit * _Point;
         
-        Print("Executing RANDOM BUY trade. Volume: ", lotSize, " SL: ", request.sl);
+        Print("Executing RANDOM BUY trade. Volume: ", lotSize, " SL: ", request.sl, " TP: ", request.tp);
     }
     else // SELL
     {
         request.type = ORDER_TYPE_SELL;
         request.price = bid;
         request.sl = ask + stopLossSize;
-        request.tp = 0; // No take profit
+        request.tp = ask - takeProfit * _Point;
         
-        Print("Executing RANDOM SELL trade. Volume: ", lotSize, " SL: ", request.sl);
+        Print("Executing RANDOM SELL trade. Volume: ", lotSize, " SL: ", request.sl, " TP: ", request.tp);
     }
     
     // Send order
@@ -263,6 +288,50 @@ void ExecuteRandomTrade()
     {
         Print("Trade execution failed. Error: ", GetLastError(), " Return code: ", result.retcode);
     }
+}
+
+//+------------------------------------------------------------------+
+//| Get current channel width                                       |
+//+------------------------------------------------------------------+
+double GetCurrentChannelWidth()
+{
+    double highBuffer[], lowBuffer[];
+    ArraySetAsSeries(highBuffer, true);
+    ArraySetAsSeries(lowBuffer, true);
+    
+    // Get high and low data for current channel period
+    if(CopyHigh(_Symbol, PERIOD_M1, 0, ChannelPeriod, highBuffer) < 0 ||
+       CopyLow(_Symbol, PERIOD_M1, 0, ChannelPeriod, lowBuffer) < 0)
+    {
+        Print("Error copying price data for channel width calculation");
+        return 0;
+    }
+    
+    // Calculate current channel width
+    double currentHigh = highBuffer[ArrayMaximum(highBuffer, 0, ChannelPeriod)];
+    double currentLow = lowBuffer[ArrayMinimum(lowBuffer, 0, ChannelPeriod)];
+    double channelWidth = currentHigh - currentLow;
+    
+    return channelWidth;
+}
+
+//+------------------------------------------------------------------+
+//| Get symbol-specific take profit                                 |
+//+------------------------------------------------------------------+
+double GetSymbolTakeProfit()
+{
+    string symbol = _Symbol;
+    
+    if(StringFind(symbol, "EURUSD") >= 0)
+        return TPPoints_EURUSD;
+    else if(StringFind(symbol, "GBPUSD") >= 0)
+        return TPPoints_GBPUSD;
+    else if(StringFind(symbol, "USDJPY") >= 0)
+        return TPPoints_USDJPY;
+    else if(StringFind(symbol, "BTCUSD") >= 0)
+        return TPPoints_BTCUSD;
+    else
+        return TPPoints_Default;
 }
 
 //+------------------------------------------------------------------+
@@ -318,24 +387,20 @@ void CheckTrailingStops()
     if(TimeLocal() - lastTrailingCheck < 30) return;
     lastTrailingCheck = TimeLocal();
     
-    // Get current ATR value
-    double atrBuffer[];
-    ArraySetAsSeries(atrBuffer, true);
-    
-    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) < 0)
+    // Get current channel width for trailing calculations
+    double currentChannelWidth = GetCurrentChannelWidth();
+    if(currentChannelWidth <= 0)
     {
-        Print("Error getting ATR for trailing stop");
+        Print("Error getting channel width for trailing stop");
         return;
     }
     
-    double currentATR = atrBuffer[0];
-    
     // Use existing SLMultiplier for trailing distance
-    double trailingDistance = currentATR * SLMultiplier;
+    double trailingDistance = currentChannelWidth * SLMultiplier;
     
-    // Use VolatilityThreshold to determine activation distance
+    // Use ChannelThreshold to determine activation distance
     // When price moves in favor by this much, start trailing
-    double activationDistance = currentATR * VolatilityThreshold;
+    double activationDistance = currentChannelWidth * ChannelThreshold;
     
     // Current market prices
     double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -392,11 +457,10 @@ void CheckTrailingStops()
             request.position = ticket;
             request.sl = NormalizeDouble(newSL, _Digits);
             request.tp = positionTP;  // Keep TP the same
-            
-            if(OrderSend(request, result))
+              if(OrderSend(request, result))
             {
                 Print("Trailing stop updated for ticket #", ticket, 
-                      " New SL: ", request.sl, " ATR: ", currentATR);
+                      " New SL: ", request.sl, " Channel Width: ", currentChannelWidth);
             }
             else
             {
