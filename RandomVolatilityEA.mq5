@@ -22,13 +22,6 @@ input double VolatilityThreshold = 0.8;      // Volatility threshold multiplier
 input group "=== Risk Management ==="
 input double SLMultiplier = 1.5;             // ATR multiplier for stop loss
 
-input group "=== Take Profit Settings ==="
-input double TPPoints_EURUSD = 8.0;          // Take profit for EURUSD (points)
-input double TPPoints_GBPUSD = 8.0;          // Take profit for GBPUSD (points)
-input double TPPoints_USDJPY = 8.0;          // Take profit for USDJPY (points)
-input double TPPoints_BTCUSD = 80.0;         // Take profit for BTCUSD (points)
-input double TPPoints_Default = 8.0;         // Default take profit (points)
-
 //--- Global variables
 int atrHandle;
 datetime lastTradeTime = 0;
@@ -46,9 +39,9 @@ int OnInit()
         Print("Error creating ATR indicator");
         return(INIT_FAILED);
     }
-    
-    // Seed random number generator
-    MathSrand((int)TimeLocal());
+      // Seed random number generator using a combination of time and memory address
+    // This ensures different seeds even during backtesting
+    MathSrand((int)TimeLocal() + (int)TimeCurrent() + (int)GetTickCount() + (int)MQL5InfoInteger(MQL5_MEMORY_USED));
     
     Print("RandomVolatilityEA initialized successfully");
     return(INIT_SUCCEEDED);
@@ -70,6 +63,9 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    // Always check trailing stops
+    CheckTrailingStops();
+    
     // Check if new bar has formed
     static datetime lastBarTime = 0;
     datetime currentBarTime = iTime(_Symbol, PERIOD_M1, 0);
@@ -201,9 +197,10 @@ bool IsLowVolatility()
 //| Execute random trade                                             |
 //+------------------------------------------------------------------+
 void ExecuteRandomTrade()
-{
-    // Generate random direction (0 = BUY, 1 = SELL)
-    int direction = MathRand() % 2;
+{    // Generate random direction (0 = BUY, 1 = SELL)
+    // Add extra randomization by using tick count and memory usage
+    int extraRandom = (int)GetTickCount() + (int)MQL5InfoInteger(MQL5_MEMORY_USED);
+    int direction = (MathRand() + extraRandom) % 2;
     
     // Get current ATR for stop loss calculation
     double atrBuffer[];
@@ -214,12 +211,8 @@ void ExecuteRandomTrade()
         Print("Error getting ATR for trade execution");
         return;
     }
-    
-    double currentATR = atrBuffer[0];
+      double currentATR = atrBuffer[0];
     double stopLossSize = currentATR * SLMultiplier;
-    
-    // Get symbol-specific take profit
-    double takeProfit = GetSymbolTakeProfit();
     
     // Calculate position size
     double lotSize = CalculateLotSize(stopLossSize);
@@ -241,24 +234,23 @@ void ExecuteRandomTrade()
     request.volume = lotSize;
     request.magic = magicNumber;
     request.deviation = 3;
-    
-    if(direction == 0) // BUY
+      if(direction == 0) // BUY
     {
         request.type = ORDER_TYPE_BUY;
         request.price = ask;
         request.sl = bid - stopLossSize;
-        request.tp = bid + takeProfit * _Point;
+        request.tp = 0; // No take profit
         
-        Print("Executing RANDOM BUY trade. Volume: ", lotSize, " SL: ", request.sl, " TP: ", request.tp);
+        Print("Executing RANDOM BUY trade. Volume: ", lotSize, " SL: ", request.sl);
     }
     else // SELL
     {
         request.type = ORDER_TYPE_SELL;
         request.price = bid;
         request.sl = ask + stopLossSize;
-        request.tp = ask - takeProfit * _Point;
+        request.tp = 0; // No take profit
         
-        Print("Executing RANDOM SELL trade. Volume: ", lotSize, " SL: ", request.sl, " TP: ", request.tp);
+        Print("Executing RANDOM SELL trade. Volume: ", lotSize, " SL: ", request.sl);
     }
     
     // Send order
@@ -271,25 +263,6 @@ void ExecuteRandomTrade()
     {
         Print("Trade execution failed. Error: ", GetLastError(), " Return code: ", result.retcode);
     }
-}
-
-//+------------------------------------------------------------------+
-//| Get symbol-specific take profit                                 |
-//+------------------------------------------------------------------+
-double GetSymbolTakeProfit()
-{
-    string symbol = _Symbol;
-    
-    if(StringFind(symbol, "EURUSD") >= 0)
-        return TPPoints_EURUSD;
-    else if(StringFind(symbol, "GBPUSD") >= 0)
-        return TPPoints_GBPUSD;
-    else if(StringFind(symbol, "USDJPY") >= 0)
-        return TPPoints_USDJPY;
-    else if(StringFind(symbol, "BTCUSD") >= 0)
-        return TPPoints_BTCUSD;
-    else
-        return TPPoints_Default;
 }
 
 //+------------------------------------------------------------------+
@@ -333,6 +306,104 @@ double CalculateLotSize(double stopLossSize)
     Print("Calculated lot size: ", lotSize, " Risk amount: ", riskAmount, " Stop loss size: ", stopLossSize);
     
     return lotSize;
+}
+
+//+------------------------------------------------------------------+
+//| Check and update trailing stops for open positions               |
+//+------------------------------------------------------------------+
+void CheckTrailingStops()
+{
+    // Check if enough time has passed since last check
+    static datetime lastTrailingCheck = 0;
+    if(TimeLocal() - lastTrailingCheck < 30) return;
+    lastTrailingCheck = TimeLocal();
+    
+    // Get current ATR value
+    double atrBuffer[];
+    ArraySetAsSeries(atrBuffer, true);
+    
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) < 0)
+    {
+        Print("Error getting ATR for trailing stop");
+        return;
+    }
+    
+    double currentATR = atrBuffer[0];
+    
+    // Use existing SLMultiplier for trailing distance
+    double trailingDistance = currentATR * SLMultiplier;
+    
+    // Use VolatilityThreshold to determine activation distance
+    // When price moves in favor by this much, start trailing
+    double activationDistance = currentATR * VolatilityThreshold;
+    
+    // Current market prices
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    // Check all open positions
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(!PositionSelectByTicket(ticket)) continue;
+        
+        // Only process our positions for this symbol
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol || 
+           PositionGetInteger(POSITION_MAGIC) != magicNumber) continue;
+           
+        double positionSL = PositionGetDouble(POSITION_SL);
+        double positionTP = PositionGetDouble(POSITION_TP);
+        double positionOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+        ENUM_POSITION_TYPE positionType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        
+        // Calculate new SL level
+        double newSL = 0.0;
+        bool modifyNeeded = false;
+        
+        if(positionType == POSITION_TYPE_BUY)
+        {
+            // For BUY positions, only trail if price has moved enough
+            if(bid - positionOpenPrice >= activationDistance)
+            {
+                newSL = bid - trailingDistance;
+                // Only modify if new SL is higher than current SL
+                modifyNeeded = (positionSL == 0 || newSL > positionSL + _Point);
+            }
+        }
+        else // SELL position
+        {
+            // For SELL positions, only trail if price has moved enough
+            if(positionOpenPrice - ask >= activationDistance)
+            {
+                newSL = ask + trailingDistance;
+                // Only modify if new SL is lower than current SL
+                modifyNeeded = (positionSL == 0 || newSL < positionSL - _Point);
+            }
+        }
+        
+        // If modification is needed, update the stop loss
+        if(modifyNeeded)
+        {
+            MqlTradeRequest request = {};
+            MqlTradeResult result = {};
+            
+            request.action = TRADE_ACTION_SLTP;
+            request.symbol = _Symbol;
+            request.position = ticket;
+            request.sl = NormalizeDouble(newSL, _Digits);
+            request.tp = positionTP;  // Keep TP the same
+            
+            if(OrderSend(request, result))
+            {
+                Print("Trailing stop updated for ticket #", ticket, 
+                      " New SL: ", request.sl, " ATR: ", currentATR);
+            }
+            else
+            {
+                Print("Failed to update trailing stop. Error: ", GetLastError());
+            }
+        }
+    }
 }
 
 //+------------------------------------------------------------------+
